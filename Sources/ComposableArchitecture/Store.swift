@@ -83,55 +83,6 @@ import SwiftUI
 /// }
 /// ```
 ///
-/// ### Thread safety
-///
-/// The `Store` class is not thread-safe, and so all interactions with an instance of ``Store``
-/// (including all of its child stores) must be done on the same thread the store was created on.
-/// Further, if the store is powering a SwiftUI or UIKit view, as is customary, then all
-/// interactions must be done on the _main_ thread.
-///
-/// The reason stores are not thread-safe is due to the fact that when an action is sent to a store,
-/// a reducer is run on the current state, and this process cannot be done from multiple threads.
-/// It is possible to make this process thread-safe by introducing locks or queues, but this
-/// introduces new complications:
-///
-///   * If done simply with `DispatchQueue.main.async` you will incur a thread hop even when you are
-///     already on the main thread. This can lead to unexpected behavior in UIKit and SwiftUI, where
-///     sometimes you are required to do work synchronously, such as in animation blocks.
-///
-///   * It is possible to create a scheduler that performs its work immediately when on the main
-///     thread and otherwise uses `DispatchQueue.main.async` (_e.g._, see Combine Schedulers'
-///     [UIScheduler][uischeduler]).
-///
-/// This introduces a lot more complexity, and should probably not be adopted without having a very
-/// good reason.
-///
-/// This is why we require all actions be sent from the same thread. This requirement is in the same
-/// spirit of how `URLSession` and other Apple APIs are designed. Those APIs tend to deliver their
-/// outputs on whatever thread is most convenient for them, and then it is your responsibility to
-/// dispatch back to the main queue if that's what you need. The Composable Architecture makes you
-/// responsible for making sure to send actions on the main thread. If you are using an effect that
-/// may deliver its output on a non-main thread, you must explicitly perform `.receive(on:)` in
-/// order to force it back on the main thread.
-///
-/// This approach makes the fewest number of assumptions about how effects are created and
-/// transformed, and prevents unnecessary thread hops and re-dispatching. It also provides some
-/// testing benefits. If your effects are not responsible for their own scheduling, then in tests
-/// all of the effects would run synchronously and immediately. You would not be able to test how
-/// multiple in-flight effects interleave with each other and affect the state of your application.
-/// However, by leaving scheduling out of the ``Store`` we get to test these aspects of our effects
-/// if we so desire, or we can ignore if we prefer. We have that flexibility.
-///
-/// [uischeduler]: https://github.com/pointfreeco/combine-schedulers/blob/main/Sources/CombineSchedulers/UIScheduler.swift
-///
-/// #### Thread safety checks
-///
-/// The store performs some basic thread safety checks in order to help catch mistakes. Stores
-/// constructed via the initializer ``init(initialState:reducer:withDependencies:)`` are assumed
-/// to run only on the main thread, and so a check is executed immediately to make sure that is the
-/// case. Further, all actions sent to the store and all scopes (see ``scope(state:action:)-90255``)
-/// of the store are also checked to make sure that work is performed on the main thread.
-///
 /// ### ObservableObject conformance
 ///
 /// The store conforms to `ObservableObject` but is _not_ observable via the `@ObservedObject`
@@ -147,8 +98,14 @@ import SwiftUI
 #else
   @preconcurrency@MainActor
 #endif
-public final class Store<State, Action> {
+public final class Store<State, Action>: _Store {
   var children: [ScopeID<State, Action>: AnyObject] = [:]
+  private weak var parent: (any _Store)?
+  private let scopeID: AnyHashable?
+
+  func removeChild(scopeID: AnyHashable) {
+    children[scopeID as! ScopeID<State, Action>] = nil
+  }
 
   let core: any Core<State, Action>
   @_spi(Internals) public var effectCancellables: [UUID: AnyCancellable] { core.effectCancellables }
@@ -188,6 +145,7 @@ public final class Store<State, Action> {
 
   init() {
     self.core = InvalidCore()
+    self.scopeID = nil
   }
 
   deinit {
@@ -209,7 +167,13 @@ public final class Store<State, Action> {
   ///   it conforms to ``ObservableState``.
   /// - Returns: The return value, if any, of the `body` closure.
   public func withState<R>(_ body: (_ state: State) -> R) -> R {
-    _withoutPerceptionChecking { body(self.currentState) }
+    #if DEBUG
+      _PerceptionLocals.$skipPerceptionChecking.withValue(true) {
+        body(self.currentState)
+      }
+    #else
+      body(self.currentState)
+    #endif
   }
 
   /// Sends an action to the store.
@@ -221,12 +185,6 @@ public final class Store<State, Action> {
   /// ```swift
   /// .task { await store.send(.task).finish() }
   /// ```
-  ///
-  /// > Important: The ``Store`` is not thread safe and you should only send actions to it from the
-  /// > main thread. If you want to send actions on background threads due to the fact that the
-  /// > reducer is performing computationally expensive work, then a better way to handle this is to
-  /// > wrap that work in an ``Effect`` that is performed on a background thread so that the
-  /// > result can be fed back into the store.
   ///
   /// - Parameter action: An action.
   /// - Returns: A ``StoreTask`` that represents the lifecycle of the effect executed when
@@ -321,7 +279,7 @@ public final class Store<State, Action> {
       let id,
       let child = children[id] as? Store<ChildState, ChildAction>
     else {
-      let child = Store<ChildState, ChildAction>(core: childCore())
+      let child = Store<ChildState, ChildAction>(core: childCore(), scopeID: id, parent: self)
       if core.canStoreCacheChildren, let id {
         children[id] = child
       }
@@ -368,18 +326,24 @@ public final class Store<State, Action> {
     core.send(action)
   }
 
-  private init(core: some Core<State, Action>) {
+  private init(core: some Core<State, Action>, scopeID: AnyHashable?, parent: (any _Store)?) {
     defer { Logger.shared.log("\(storeTypeName(of: self)).init") }
     self.core = core
+    self.parent = parent
+    self.scopeID = scopeID
 
     if let stateType = State.self as? any ObservableState.Type {
       func subscribeToDidSet<T: ObservableState>(_ type: T.Type) -> AnyCancellable {
         return core.didSet
-          .prefix { [weak self] _ in self?.core.isInvalid != true }
+          .prefix { [weak self] _ in self?.core.isInvalid == false }
           .compactMap { [weak self] in (self?.currentState as? T)?._$id }
           .removeDuplicates()
           .dropFirst()
           .sink { [weak self] _ in
+            guard let scopeID = self?.scopeID
+            else { return }
+            parent?.removeChild(scopeID: scopeID)
+          } receiveValue: { [weak self] _ in
             guard let self else { return }
             self._$observationRegistrar.withMutation(of: self, keyPath: \.currentState) {}
           }
@@ -392,7 +356,11 @@ public final class Store<State, Action> {
     initialState: R.State,
     reducer: R
   ) {
-    self.init(core: RootCore(initialState: initialState, reducer: reducer))
+    self.init(
+      core: RootCore(initialState: initialState, reducer: reducer),
+      scopeID: nil,
+      parent: nil
+    )
   }
 
   /// A publisher that emits when state changes.
@@ -620,3 +588,8 @@ let _isStorePerceptionCheckingEnabled: Bool = {
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   extension Store: Observable {}
 #endif
+
+@MainActor
+private protocol _Store: AnyObject {
+  func removeChild(scopeID: AnyHashable)
+}

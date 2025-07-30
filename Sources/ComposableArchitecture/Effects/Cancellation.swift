@@ -43,6 +43,7 @@ extension Effect {
       return Self(
         operation: .publisher(
           Deferred {
+            [navigationIDPath]
             ()
               -> Publishers.HandleEvents<
                 Publishers.PrefixUntilOutput<
