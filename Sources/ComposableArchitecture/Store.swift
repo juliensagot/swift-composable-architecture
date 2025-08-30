@@ -1,4 +1,5 @@
 import Combine
+import CombineSchedulers
 import Foundation
 import SwiftUI
 
@@ -336,7 +337,7 @@ public final class Store<State, Action>: _Store {
       func subscribeToDidSet<T: ObservableState>(_ type: T.Type) -> AnyCancellable {
         return core.didSet
           .prefix { [weak self] _ in self?.core.isInvalid == false }
-          .compactMap { [weak self] in (self?.currentState as? T)?._$id }
+          .compactMap { [weak self] in (self?.withState(\.self) as? T)?._$id }
           .removeDuplicates()
           .dropFirst()
           .sink { [weak self, weak parent] _ in
@@ -375,7 +376,7 @@ public final class Store<State, Action>: _Store {
   public var publisher: StorePublisher<State> {
     StorePublisher(
       store: self,
-      upstream: self.core.didSet.map { self.currentState }
+      upstream: self.core.didSet.receive(on: UIScheduler.shared).map { self.withState(\.self) }
     )
   }
 
