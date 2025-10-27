@@ -113,7 +113,7 @@ extension Effect {
               guard let handler else {
                 reportIssue(
                   """
-                  An "Effect.run" returned from "\(fileID):\(line)" threw an unhandled error. …
+                  An "Effect.run" returned from "\(fileID):\(line)" threw an unhandled error.
 
                   \(String(customDumping: error).indent(by: 4))
 
@@ -423,7 +423,7 @@ extension Effect {
       name: String?,
       priority: TaskPriority? = nil,
       operation: @escaping @Sendable () async throws -> Success
-    ) where Failure == Error {
+    ) where Failure == any Error {
       self.init(priority: priority, operation: operation)
     }
   }
